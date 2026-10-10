@@ -1,0 +1,18 @@
+# Build outputs & intermediate object files
+sdk/cef/build/
+portable/obj/
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# Archives
+*.zip
+*.7z
+*.rar
+*.tar.gz
+
+# IDE / Editor folders
+.vs/
+.vscode/
+*.user

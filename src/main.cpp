@@ -103,6 +103,7 @@ enum HeaderControl {
   CTRL_SEARCH = 4,
   CTRL_CLEAR = 5,
   CTRL_TYPING = 6,
+  CTRL_SHIFT = 7,
   CTRL_TAB_BASE = 100 // CTRL_TAB_BASE + i
 };
 
@@ -111,6 +112,7 @@ static bool g_canGoBack = false;
 static bool g_canGoForward = false;
 static bool g_isLoading = false;
 static std::atomic<bool> g_typingEnabled{false};
+static std::atomic<bool> g_shiftToggle{false};
 
 static std::string g_url    = "https://chatgpt.com/";
 static std::string g_dataDir;                  // %LOCALAPPDATA%\QuickSearch
@@ -849,9 +851,16 @@ static HeaderControl HitTestHeader(int wx, int wy, int winW) {
     return CTRL_TYPING;
   }
 
+  // Shift toggle button (anchored left of typing button)
+  int shfX1 = typX0 - 8;
+  int shfX0 = shfX1 - 96;
+  if (wx >= shfX0 && wx <= shfX1) {
+    return CTRL_SHIFT;
+  }
+
   // Tabs
   int curX = 216;
-  int maxTabsX = typX0 - 16;
+  int maxTabsX = shfX0 - 16;
   for (int i = 0; i < (int)g_sites.size(); ++i) {
     int tabW = g_sites[i].tabWidth > 0 ? g_sites[i].tabWidth : 58;
     if (curX + tabW > maxTabsX) break;
@@ -1688,6 +1697,7 @@ constexpr UINT kChordTypingToggle = WM_APP + 25; // Ctrl+Alt+T
 constexpr UINT kChordPaste  = WM_APP + 26; // Ctrl+V over the overlay
 constexpr UINT kChordTabNext = WM_APP + 27; // Ctrl+Tab over the overlay
 constexpr UINT kRouterKeyMsg = WM_APP + 28; // keyboard event delivery for typing
+constexpr UINT kChordShiftToggle = WM_APP + 29; // Ctrl+Alt+K
 constexpr UINT kChordSiteBase = WM_APP + 30; // Ctrl+1..5 over the overlay
 
 struct RouterEvent { unsigned msg; int x, y, data; };
@@ -1836,7 +1846,7 @@ inline bool IsShiftDown() {
               ((GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0) ||
               ((GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0);
   if (!phys) g_shiftHeld.store(false);
-  return phys || g_shiftHeld.load();
+  return phys || g_shiftHeld.load() || g_shiftToggle.load();
 }
 
 inline bool IsCtrlDown() {
@@ -1912,6 +1922,7 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wParam, LPARAM lParam) {
     else if (ctrl && alt && ks->vkCode == 'S') msg = kChordShot;
     else if (ctrl && alt && ks->vkCode == 'Q') msg = kChordQuit;
     else if (ctrl && alt && ks->vkCode == 'T') msg = kChordTypingToggle;
+    else if (ctrl && alt && ks->vkCode == 'K') msg = kChordShiftToggle;
     else if (ctrl && !alt && ks->vkCode == 'V' && g_routing && IsVisible()) {
       POINT pt;
       if (GetCursorPos(&pt) && Inside((int)pt.x, (int)pt.y)) msg = kChordPaste;
@@ -2460,7 +2471,233 @@ static void Shutdown() {
 
 }  // namespace host
 
-// ---------------------------------------------------------------- input dispatch
+// ---------------------------------------------------------------- window resize & drag
+enum ResizeEdge {
+  RESIZE_NONE = 0,
+  RESIZE_LEFT = 1,
+  RESIZE_RIGHT = 2,
+  RESIZE_TOP = 3,
+  RESIZE_BOTTOM = 4,
+  RESIZE_TOPLEFT = 5,
+  RESIZE_TOPRIGHT = 6,
+  RESIZE_BOTTOMLEFT = 7,
+  RESIZE_BOTTOMRIGHT = 8
+};
+
+static bool g_resizing = false;
+static ResizeEdge g_resizeEdge = RESIZE_NONE;
+static POINT g_resizeStart = {};
+static RECT g_resizeWndStart = {};
+static ResizeEdge g_lastResizeHover = RESIZE_NONE;
+
+static ResizeEdge HitTestResize(int wx, int wy, int winW, int winH) {
+  const int kBorder = 7;
+  const int kCorner = 16;
+  const int kGrip = 24;
+
+  if (wx < 0 || wx > winW || wy < 0 || wy > winH) return RESIZE_NONE;
+
+  // Never hijack clicks on header buttons/tabs
+  if (wy < kHeader && HitTestHeader(wx, wy, winW) != CTRL_NONE) {
+    return RESIZE_NONE;
+  }
+
+  // Never hijack clicks on sidebar thumbnails
+  if (wx >= SidebarLeft(winW) && wy >= kHeader && ThumbAt(wx, wy, winW) >= 0) {
+    return RESIZE_NONE;
+  }
+
+  // Bottom-Right corner (including designated resize grip in sidebar)
+  if ((wx >= winW - kGrip && wy >= winH - kGrip) ||
+      (wx >= winW - kCorner && wy >= winH - kBorder) ||
+      (wx >= winW - kBorder && wy >= winH - kCorner)) {
+    return RESIZE_BOTTOMRIGHT;
+  }
+
+  // Bottom-Left corner
+  if ((wx <= kCorner && wy >= winH - kBorder) ||
+      (wx <= kBorder && wy >= winH - kCorner)) {
+    return RESIZE_BOTTOMLEFT;
+  }
+
+  // Top-Right corner (outside header controls)
+  if (wy <= kBorder && wx >= winW - kCorner) {
+    return RESIZE_TOPRIGHT;
+  }
+
+  // Top-Left corner (outside header controls)
+  if (wy <= kBorder && wx <= kCorner) {
+    return RESIZE_TOPLEFT;
+  }
+
+  // Top edge (very top strip outside header buttons)
+  if (wy <= 4) {
+    return RESIZE_TOP;
+  }
+
+  // Bottom edge
+  if (wy >= winH - kBorder) {
+    return RESIZE_BOTTOM;
+  }
+
+  // Right edge
+  if (wx >= winW - kBorder) {
+    return RESIZE_RIGHT;
+  }
+
+  // Left edge
+  if (wx <= kBorder) {
+    return RESIZE_LEFT;
+  }
+
+  return RESIZE_NONE;
+}
+
+static void UpdateResizeCursor(ResizeEdge edge) {
+  HCURSOR hCur = nullptr;
+  switch (edge) {
+    case RESIZE_LEFT:
+    case RESIZE_RIGHT:
+      hCur = LoadCursor(nullptr, IDC_SIZEWE);
+      break;
+    case RESIZE_TOP:
+    case RESIZE_BOTTOM:
+      hCur = LoadCursor(nullptr, IDC_SIZENS);
+      break;
+    case RESIZE_TOPLEFT:
+    case RESIZE_BOTTOMRIGHT:
+      hCur = LoadCursor(nullptr, IDC_SIZENWSE);
+      break;
+    case RESIZE_TOPRIGHT:
+    case RESIZE_BOTTOMLEFT:
+      hCur = LoadCursor(nullptr, IDC_SIZENESW);
+      break;
+    default:
+      break;
+  }
+  if (hCur) {
+    SetCursor(hCur);
+    g_lastResizeHover = edge;
+  } else if (g_lastResizeHover != RESIZE_NONE) {
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+    g_lastResizeHover = RESIZE_NONE;
+  }
+}
+
+static void ResizeBegin(int sx, int sy, ResizeEdge edge) {
+  g_resizing = true;
+  g_resizeEdge = edge;
+  g_resizeStart = { sx, sy };
+  GetWindowRect(g_hwnd, &g_resizeWndStart);
+}
+
+static void ResizeMove(int sx, int sy) {
+  if (!g_resizing || g_resizeEdge == RESIZE_NONE) return;
+
+  int dx = sx - g_resizeStart.x;
+  int dy = sy - g_resizeStart.y;
+
+  RECT r = g_resizeWndStart;
+  int initW = r.right - r.left;
+  int initH = r.bottom - r.top;
+
+  const int kMinW = 550;
+  const int kMinH = 300;
+
+  switch (g_resizeEdge) {
+    case RESIZE_RIGHT: {
+      int nw = initW + dx;
+      if (nw < kMinW) nw = kMinW;
+      r.right = r.left + nw;
+      break;
+    }
+    case RESIZE_BOTTOM: {
+      int nh = initH + dy;
+      if (nh < kMinH) nh = kMinH;
+      r.bottom = r.top + nh;
+      break;
+    }
+    case RESIZE_BOTTOMRIGHT: {
+      int nw = initW + dx;
+      int nh = initH + dy;
+      if (nw < kMinW) nw = kMinW;
+      if (nh < kMinH) nh = kMinH;
+      r.right = r.left + nw;
+      r.bottom = r.top + nh;
+      break;
+    }
+    case RESIZE_LEFT: {
+      int nw = initW - dx;
+      if (nw < kMinW) nw = kMinW;
+      r.left = r.right - nw;
+      break;
+    }
+    case RESIZE_TOP: {
+      int nh = initH - dy;
+      if (nh < kMinH) nh = kMinH;
+      r.top = r.bottom - nh;
+      break;
+    }
+    case RESIZE_BOTTOMLEFT: {
+      int nw = initW - dx;
+      int nh = initH + dy;
+      if (nw < kMinW) nw = kMinW;
+      if (nh < kMinH) nh = kMinH;
+      r.left = r.right - nw;
+      r.bottom = r.top + nh;
+      break;
+    }
+    case RESIZE_TOPLEFT: {
+      int nw = initW - dx;
+      int nh = initH - dy;
+      if (nw < kMinW) nw = kMinW;
+      if (nh < kMinH) nh = kMinH;
+      r.left = r.right - nw;
+      r.top = r.bottom - nh;
+      break;
+    }
+    case RESIZE_TOPRIGHT: {
+      int nw = initW + dx;
+      int nh = initH - dy;
+      if (nw < kMinW) nw = kMinW;
+      if (nh < kMinH) nh = kMinH;
+      r.right = r.left + nw;
+      r.top = r.bottom - nh;
+      break;
+    }
+    default:
+      break;
+  }
+
+  int nw = r.right - r.left;
+  int nh = r.bottom - r.top;
+  int nx = r.left;
+  int ny = r.top;
+
+  g_w = nw;
+  g_h = nh;
+  g_x = nx;
+  g_y = ny;
+
+  if (GetParent(g_hwnd)) {
+    POINT p = { nx, ny };
+    ScreenToClient(GetParent(g_hwnd), &p);
+    SetWindowPos(g_hwnd, nullptr, p.x, p.y, nw, nh,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+  } else {
+    SetWindowPos(g_hwnd, nullptr, nx, ny, nw, nh,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+  }
+
+  router::UpdateBounds();
+}
+
+static void ResizeEnd() {
+  g_resizing = false;
+  g_resizeEdge = RESIZE_NONE;
+  router::UpdateBounds();
+}
+
 // Middle-mouse window drag + header left-drag move the window; sidebar owns
 // wheel/LMB(thumb drag); everything else is forwarded to CEF as OSR mouse
 // events in PAGE coordinates. Coordinates arrive in SCREEN px from the router.
@@ -2473,6 +2710,8 @@ static void DragMove(int sx, int sy) {
   if (!g_dragging) return;
   int nx = g_dragWndStart.left + (sx - g_dragStart.x);
   int ny = g_dragWndStart.top + (sy - g_dragStart.y);
+  g_x = nx;
+  g_y = ny;
   if (GetParent(g_hwnd)) {   // hosted: position is in parent client coords
     POINT p = { nx, ny };
     ScreenToClient(GetParent(g_hwnd), &p);
@@ -2482,6 +2721,7 @@ static void DragMove(int sx, int sy) {
     SetWindowPos(g_hwnd, nullptr, nx, ny, 0, 0,
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
   }
+  router::UpdateBounds();
 }
 static void DragEnd() { g_dragging = false; }
 
@@ -2493,7 +2733,7 @@ static uint32_t CefModifiers() {
   if (g_mkFlags & MK_LBUTTON) m |= EVENTFLAG_LEFT_MOUSE_BUTTON;
   if (g_mkFlags & MK_RBUTTON) m |= EVENTFLAG_RIGHT_MOUSE_BUTTON;
   if (g_mkFlags & MK_MBUTTON) m |= EVENTFLAG_MIDDLE_MOUSE_BUTTON;
-  if (g_mkFlags & MK_SHIFT)   m |= EVENTFLAG_SHIFT_DOWN;
+  if ((g_mkFlags & MK_SHIFT) || router::IsShiftDown())   m |= EVENTFLAG_SHIFT_DOWN;
   if (g_mkFlags & MK_CONTROL) m |= EVENTFLAG_CONTROL_DOWN;
   return m;
 }
@@ -2647,10 +2887,41 @@ static void DeliverToPage(unsigned msg, int sx, int sy, int data) {
   if (msg == WM_MBUTTONDOWN) { DragBegin(sx, sy); return; }
   if (msg == WM_MBUTTONUP)   { DragEnd(); return; }
 
+  // Resizing in progress
+  if (g_resizing) {
+    if (msg == WM_MOUSEMOVE) {
+      UpdateResizeCursor(g_resizeEdge);
+      ResizeMove(sx, sy);
+      return;
+    }
+    if (msg == WM_LBUTTONUP) {
+      ResizeEnd();
+      UpdateResizeCursor(RESIZE_NONE);
+      return;
+    }
+  }
+
+  // Window drag in progress
+  if (g_dragging) {
+    if (msg == WM_MOUSEMOVE) { DragMove(sx, sy); return; }
+    if (msg == WM_LBUTTONUP) { DragEnd(); return; }
+  }
+
+  // Hit test resize border/corners
+  ResizeEdge resizeHit = HitTestResize(wx, wy, clientW, clientH);
+  if (msg == WM_MOUSEMOVE && !g_dragging && !g_resizing) {
+    UpdateResizeCursor(resizeHit);
+  }
+  if (msg == WM_LBUTTONDOWN && resizeHit != RESIZE_NONE) {
+    ResizeBegin(sx, sy, resizeHit);
+    UpdateResizeCursor(resizeHit);
+    return;
+  }
+
   bool inHeader = wy < hdr;
 
   if (inHeader) {
-    if (msg == WM_MOUSEMOVE && !g_dragging) {
+    if (msg == WM_MOUSEMOVE && !g_dragging && !g_resizing) {
       HeaderControl hit = HitTestHeader(wx, wy, clientW);
       if (hit != g_hoverCtrl) {
         g_hoverCtrl = hit;
@@ -2711,6 +2982,13 @@ static void DeliverToPage(unsigned msg, int sx, int sy, int data) {
           }
         }
         Log("[nav] search button clicked -> Google");
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        ComposeAndPresent();
+        return;
+      }
+      if (hit == CTRL_SHIFT) {
+        g_shiftToggle.store(!g_shiftToggle.load());
+        Log("[shift] toggled via button -> %s", g_shiftToggle.load() ? "ON" : "OFF");
         InvalidateRect(g_hwnd, nullptr, FALSE);
         ComposeAndPresent();
         return;
@@ -3009,17 +3287,66 @@ static void DrawTopBar(HDC hdc, int winW, int hdr) {
   SetTextColor(hdc, typingOn ? RGB(0xFF, 0xFF, 0xFF) : (typHover ? RGB(0xEB, 0xE9, 0xF2) : RGB(0xA2, 0xA0, 0xAC)));
   DrawTextW(hdc, typingOn ? L"TYPE: ON" : L"TYPE: OFF", -1, &typTextRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-  // Divider before typing button
-  HPEN divPenTyp = CreatePen(PS_SOLID, 1, RGB(0x3E, 0x3C, 0x46));
-  HGDIOBJ prevPenTyp = SelectObject(hdc, divPenTyp);
-  MoveToEx(hdc, typX0 - 8, 6, nullptr);
-  LineTo(hdc, typX0 - 8, hdr - 6);
-  SelectObject(hdc, prevPenTyp);
-  DeleteObject(divPenTyp);
+  // Shift toggle button (anchored left of typing button)
+  int shfX1 = typX0 - 8;
+  int shfX0 = shfX1 - 96;
+  RECT shfRc = { shfX0, btnY0, shfX1, btnY1 };
+  bool shfHover = (g_hoverCtrl == CTRL_SHIFT);
+  bool shiftOn = g_shiftToggle.load();
+
+  if (shiftOn) {
+    if (shfHover) {
+      DrawPill(shfRc, RGB(0x23, 0x48, 0x6A), RGB(0x3B, 0x82, 0xF6));
+    } else {
+      DrawPill(shfRc, RGB(0x19, 0x36, 0x52), RGB(0x25, 0x63, 0xEB));
+    }
+  } else {
+    if (shfHover) {
+      DrawPill(shfRc, RGB(0x35, 0x33, 0x3D), RGB(0x4C, 0x4A, 0x56));
+    } else {
+      DrawPill(shfRc, RGB(0x27, 0x26, 0x2C), RGB(0x2F, 0x2E, 0x34));
+    }
+  }
+
+  // Shift Dot indicator
+  int shfDotX = shfX0 + 10;
+  int shfDotY = (btnY0 + btnY1) / 2 - 3;
+  COLORREF shfDotColor = shiftOn ? RGB(0x60, 0xA5, 0xFA) : RGB(0x76, 0x74, 0x82);
+  HBRUSH shfDotBr = CreateSolidBrush(shfDotColor);
+  HPEN shfDotPn = CreatePen(PS_SOLID, 1, shfDotColor);
+  HGDIOBJ osBr = SelectObject(hdc, shfDotBr);
+  HGDIOBJ osPn = SelectObject(hdc, shfDotPn);
+  Ellipse(hdc, shfDotX, shfDotY, shfDotX + 6, shfDotY + 6);
+  SelectObject(hdc, osPn);
+  SelectObject(hdc, osBr);
+  DeleteObject(shfDotPn);
+  DeleteObject(shfDotBr);
+
+  // Text label: "SHIFT: ON" / "SHIFT: OFF"
+  SelectObject(hdc, fontBold);
+  RECT shfTextRc = { shfX0 + 22, btnY0, shfX1 - 4, btnY1 };
+  SetTextColor(hdc, shiftOn ? RGB(0xFF, 0xFF, 0xFF) : (shfHover ? RGB(0xEB, 0xE9, 0xF2) : RGB(0xA2, 0xA0, 0xAC)));
+  DrawTextW(hdc, shiftOn ? L"SHIFT: ON" : L"SHIFT: OFF", -1, &shfTextRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+  // Divider between shift and type buttons
+  HPEN divPenMid = CreatePen(PS_SOLID, 1, RGB(0x3E, 0x3C, 0x46));
+  HGDIOBJ prevPenMid = SelectObject(hdc, divPenMid);
+  MoveToEx(hdc, typX0 - 4, 6, nullptr);
+  LineTo(hdc, typX0 - 4, hdr - 6);
+  SelectObject(hdc, prevPenMid);
+  DeleteObject(divPenMid);
+
+  // Divider before shift button
+  HPEN divPenShf = CreatePen(PS_SOLID, 1, RGB(0x3E, 0x3C, 0x46));
+  HGDIOBJ prevPenShf = SelectObject(hdc, divPenShf);
+  MoveToEx(hdc, shfX0 - 8, 6, nullptr);
+  LineTo(hdc, shfX0 - 8, hdr - 6);
+  SelectObject(hdc, prevPenShf);
+  DeleteObject(divPenShf);
 
   // 3. Site Tabs
   int curX = 216;
-  int maxTabsX = typX0 - 16;
+  int maxTabsX = shfX0 - 16;
   for (int i = 0; i < (int)g_sites.size(); ++i) {
     int tabW = g_sites[i].tabWidth > 0 ? g_sites[i].tabWidth : 58;
     if (curX + tabW > maxTabsX) break;
@@ -3143,6 +3470,19 @@ static void DrawChrome(HDC hdc, int winW, int winH) {
   SelectObject(hdc, oldBrush);
   SelectObject(hdc, oldPen);
   DeleteObject(border);
+
+  // Bottom-right corner resize grip indicator
+  COLORREF gripCol = (g_resizing && g_resizeEdge == RESIZE_BOTTOMRIGHT)
+      ? RGB(0x60, 0xA5, 0xFA)
+      : ((g_lastResizeHover == RESIZE_BOTTOMRIGHT) ? RGB(0xA0, 0x9E, 0xAC) : RGB(0x6E, 0x6C, 0x78));
+  HPEN gripPen = CreatePen(PS_SOLID, 1, gripCol);
+  HGDIOBJ prevGripPen = SelectObject(hdc, gripPen);
+  for (int d = 4; d <= 16; d += 4) {
+    MoveToEx(hdc, winW - d, winH - 2, nullptr);
+    LineTo(hdc, winW - 2, winH - d);
+  }
+  SelectObject(hdc, prevGripPen);
+  DeleteObject(gripPen);
 }
 
 // ---------------------------------------------------------------- wndproc
@@ -3222,6 +3562,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
           g_browser->GetHost()->SetFocus(true);
         }
       }
+      InvalidateRect(hwnd, nullptr, FALSE);
+      ComposeAndPresent();
+      return 0;
+    }
+    case router::kChordShiftToggle: {
+      g_shiftToggle.store(!g_shiftToggle.load());
+      Log("[chord] shift toggle -> %s", g_shiftToggle.load() ? "ON" : "OFF");
       InvalidateRect(hwnd, nullptr, FALSE);
       ComposeAndPresent();
       return 0;

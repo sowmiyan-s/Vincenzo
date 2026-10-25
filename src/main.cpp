@@ -2098,6 +2098,12 @@ static void SetVisible(bool visible) {
     cursor::Hide();
     ghost::Hide();
   }
+  if (g_browser && g_browser->GetHost()) {
+    g_browser->GetHost()->WasHidden(!visible);
+    if (visible) {
+      g_browser->GetHost()->Invalidate(PET_VIEW);
+    }
+  }
 }
 
 // ============================================================================
@@ -2746,10 +2752,40 @@ static void ResizeMove(int sx, int sy) {
   router::UpdateBounds();
 }
 
+static void SaveCurrentGeometry() {
+  if (!g_hwnd || IsIconic(g_hwnd)) return;
+  RECT rc;
+  if (GetWindowRect(g_hwnd, &rc)) {
+    if (g_dataDir.empty()) return;
+    std::string path = g_dataDir + "\\geometry.ini";
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+    if (w >= 400 && h >= 300) {
+      WritePrivateProfileStringA("Geometry", "x", std::to_string(rc.left).c_str(), path.c_str());
+      WritePrivateProfileStringA("Geometry", "y", std::to_string(rc.top).c_str(), path.c_str());
+      WritePrivateProfileStringA("Geometry", "w", std::to_string(w).c_str(), path.c_str());
+      WritePrivateProfileStringA("Geometry", "h", std::to_string(h).c_str(), path.c_str());
+    }
+  }
+}
+
+static void LoadSavedGeometry(int& x, int& y, int& w, int& h) {
+  if (g_dataDir.empty()) return;
+  std::string path = g_dataDir + "\\geometry.ini";
+  int sx = GetPrivateProfileIntA("Geometry", "x", -9999, path.c_str());
+  int sy = GetPrivateProfileIntA("Geometry", "y", -9999, path.c_str());
+  int sw = GetPrivateProfileIntA("Geometry", "w", 0, path.c_str());
+  int sh = GetPrivateProfileIntA("Geometry", "h", 0, path.c_str());
+  if (sw >= 400 && sh >= 300 && sx != -9999 && sy != -9999) {
+    x = sx; y = sy; w = sw; h = sh;
+  }
+}
+
 static void ResizeEnd() {
   g_resizing = false;
   g_resizeEdge = RESIZE_NONE;
   router::UpdateBounds();
+  SaveCurrentGeometry();
 }
 
 // Middle-mouse window drag + header left-drag move the window; sidebar owns
@@ -2777,7 +2813,10 @@ static void DragMove(int sx, int sy) {
   }
   router::UpdateBounds();
 }
-static void DragEnd() { g_dragging = false; }
+static void DragEnd() {
+  g_dragging = false;
+  SaveCurrentGeometry();
+}
 
 // Current button state for EVENTFLAG_* modifiers on synthesized events.
 static WPARAM g_mkFlags = 0;
@@ -3693,6 +3732,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       return DefWindowProc(hwnd, msg, wParam, lParam);
 
     case WM_DESTROY:
+      SaveCurrentGeometry();
       router::Stop();
       ghost::Destroy();
       cursor::Destroy();
@@ -3787,6 +3827,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
   router::SyncCapsLock();
 
+  char base[MAX_PATH];
+  if (SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, base) != S_OK)
+    snprintf(base, sizeof(base), "C:\\Temp");
+  g_dataDir = std::string(base) + "\\QuickSearch";
+  EnsureDir(g_dataDir);
+
   std::string argUrl  = GetArg(ac, av.data(), "--url", "");
   std::string argSite = GetArg(ac, av.data(), "--site", "");
 
@@ -3824,6 +3870,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
   g_y = atoi(GetArg(ac, av.data(), "--y", "0").c_str());
   g_w = atoi(GetArg(ac, av.data(), "--w", "1280").c_str());
   g_h = atoi(GetArg(ac, av.data(), "--h", "900").c_str());
+
+  bool hasCustomGeom = HasArg(ac, av.data(), "--x") || HasArg(ac, av.data(), "--y") ||
+                       HasArg(ac, av.data(), "--w") || HasArg(ac, av.data(), "--h");
+  if (!hasCustomGeom) {
+    LoadSavedGeometry(g_x, g_y, g_w, g_h);
+  }
 
   // Clamp persisted/handoff geometry to the current screen. A stale --x from
   // an earlier session (e.g. x=320 on a 1360-wide screen with w=1280) pushed
@@ -3895,11 +3947,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     }
   }
 
-  char base[MAX_PATH];
-  if (SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, base) != S_OK)
-    snprintf(base, sizeof(base), "C:\\Temp");
-  g_dataDir = std::string(base) + "\\QuickSearch";
-  EnsureDir(g_dataDir);
 
   Log("QuickSearch starting: %s (topmost=%d hidden=%d)", g_url.c_str(),
       (int)g_topmost, (int)g_startHidden);

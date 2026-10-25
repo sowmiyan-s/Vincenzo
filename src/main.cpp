@@ -73,6 +73,8 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "rpcrt4.lib")
+#pragma comment(lib, "advapi32.lib")
+#include <aclapi.h>
 
 // ---------------------------------------------------------------- settings & sites
 struct SiteItem {
@@ -104,6 +106,7 @@ enum HeaderControl {
   CTRL_CLEAR = 5,
   CTRL_TYPING = 6,
   CTRL_SHIFT = 7,
+  CTRL_CLOSE = 8,
   CTRL_TAB_BASE = 100 // CTRL_TAB_BASE + i
 };
 
@@ -113,6 +116,7 @@ static bool g_canGoForward = false;
 static bool g_isLoading = false;
 static std::atomic<bool> g_typingEnabled{false};
 static std::atomic<bool> g_shiftToggle{false};
+static std::atomic<bool> g_allowExit{false};
 
 static std::string g_url    = "https://chatgpt.com/";
 static std::string g_dataDir;                  // %LOCALAPPDATA%\QuickSearch
@@ -136,6 +140,49 @@ static void Log(const char* fmt, ...) {
 
 static bool EnsureDir(const std::string& dir) {
   return CreateDirectoryA(dir.c_str(), nullptr) != 0 || GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+static void HardenProcessSecurity() {
+  HANDLE hProcess = GetCurrentProcess();
+  PSID pEveryoneSid = nullptr;
+  SID_IDENTIFIER_AUTHORITY SIDAuthWorld = SECURITY_WORLD_SID_AUTHORITY;
+  if (!AllocateAndInitializeSid(&SIDAuthWorld, 1, SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &pEveryoneSid)) {
+    Log("[protect] AllocateAndInitializeSid failed %lu", GetLastError());
+    return;
+  }
+
+  EXPLICIT_ACCESS_W ea = {};
+  ea.grfAccessPermissions = PROCESS_TERMINATE | PROCESS_SUSPEND_RESUME;
+  ea.grfAccessMode = DENY_ACCESS;
+  ea.grfInheritance = NO_INHERITANCE;
+  ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+  ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+  ea.Trustee.ptstrName = (LPWSTR)pEveryoneSid;
+
+  PACL pOldAcl = nullptr;
+  PSECURITY_DESCRIPTOR pSD = nullptr;
+  DWORD res = GetSecurityInfo(hProcess, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+                              nullptr, nullptr, &pOldAcl, nullptr, &pSD);
+  if (res == ERROR_SUCCESS) {
+    PACL pNewAcl = nullptr;
+    res = SetEntriesInAclW(1, &ea, pOldAcl, &pNewAcl);
+    if (res == ERROR_SUCCESS) {
+      DWORD setRes = SetSecurityInfo(hProcess, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+                                     nullptr, nullptr, pNewAcl, nullptr);
+      if (setRes == ERROR_SUCCESS) {
+        Log("[protect] Process termination & suspend protection active (DACL hardened)");
+      } else {
+        Log("[protect] SetSecurityInfo failed: %lu", setRes);
+      }
+      LocalFree(pNewAcl);
+    } else {
+      Log("[protect] SetEntriesInAcl failed: %lu", res);
+    }
+    LocalFree(pSD);
+  } else {
+    Log("[protect] GetSecurityInfo failed: %lu", res);
+  }
+  FreeSid(pEveryoneSid);
 }
 
 static std::string GetArg(int argc, char** argv, const char* name, const char* def) {
@@ -823,12 +870,18 @@ static HeaderControl HitTestHeader(int wx, int wy, int winW) {
   int btnY0 = 3;
   int btnY1 = kHeader - 3;
   if (wy < btnY0 || wy > btnY1) {
-    if (wx >= SidebarLeft(winW)) return CTRL_CLEAR;
+    if (wx >= winW - 28 && wx <= winW - 4) return CTRL_CLOSE;
+    if (wx >= SidebarLeft(winW) + 4 && wx <= winW - 32) return CTRL_CLEAR;
     return CTRL_NONE;
   }
 
-  // CLEAR button above sidebar
-  if (wx >= SidebarLeft(winW) + 4 && wx <= winW - 4) {
+  // CLOSE button (X) at far top-right
+  if (wx >= winW - 28 && wx <= winW - 4) {
+    return CTRL_CLOSE;
+  }
+
+  // CLEAR button above sidebar (left of Close button)
+  if (wx >= SidebarLeft(winW) + 4 && wx <= winW - 32) {
     return CTRL_CLEAR;
   }
 
@@ -2245,6 +2298,7 @@ static void BeginHandoff(const std::string& targetDesktop) {
   Log("handoff: complete — old instance exiting");
   CloseHandle(pi.hProcess);
   CloseHandle(opened); CloseHandle(released); CloseHandle(failed); CloseHandle(ready);
+  g_allowExit.store(true);
   PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
 }
 
@@ -2932,6 +2986,12 @@ static void DeliverToPage(unsigned msg, int sx, int sy, int data) {
     }
     if (msg == WM_LBUTTONDOWN) {
       HeaderControl hit = HitTestHeader(wx, wy, clientW);
+      if (hit == CTRL_CLOSE) {
+        Log("[ui] Close 'X' button clicked by user — closing app");
+        g_allowExit.store(true);
+        DestroyWindow(g_hwnd);
+        return;
+      }
       if (hit == CTRL_CLEAR) {
         g_thumbs.clear();
         g_thumbDrag = -1;
@@ -3416,8 +3476,8 @@ static void DrawTopBar(HDC hdc, int winW, int hdr) {
     DeleteObject(gripBr);
   }
 
-  // 5. CLEAR button (above sidebar)
-  RECT clearRc = { SidebarLeft(winW) + 4, btnY0, winW - 4, btnY1 };
+  // 5. CLEAR button (above sidebar, left of Close button)
+  RECT clearRc = { SidebarLeft(winW) + 4, btnY0, winW - 32, btnY1 };
   bool clearHover = (g_hoverCtrl == CTRL_CLEAR);
   if (clearHover) {
     DrawPill(clearRc, RGB(0x3D, 0x28, 0x2C), RGB(0x56, 0x36, 0x3C));
@@ -3428,6 +3488,19 @@ static void DrawTopBar(HDC hdc, int winW, int hdr) {
   }
   SelectObject(hdc, fontBold);
   DrawTextW(hdc, L"CLEAR", -1, &clearRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+  // 6. CLOSE (X) button (far top-right)
+  RECT closeRc = { winW - 28, btnY0, winW - 4, btnY1 };
+  bool closeHover = (g_hoverCtrl == CTRL_CLOSE);
+  if (closeHover) {
+    DrawPill(closeRc, RGB(0x8B, 0x1A, 0x1A), RGB(0xE8, 0x11, 0x23));
+    SetTextColor(hdc, RGB(0xFF, 0xFF, 0xFF));
+  } else {
+    DrawPill(closeRc, RGB(0x27, 0x26, 0x2C), RGB(0x2F, 0x2E, 0x34));
+    SetTextColor(hdc, RGB(0xB8, 0xB6, 0xC2));
+  }
+  SelectObject(hdc, fontSym ? fontSym : fontBold);
+  DrawTextW(hdc, L"\u2715", -1, &closeRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
   // Clean up GDI fonts
   SelectObject(hdc, oldFont);
@@ -3552,7 +3625,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case router::kChordToggle: Log("[chord] toggle"); DoToggle(); return 0;
     case router::kChordShot:   Log("[chord] screenshot"); ScreenshotNow(); return 0;
-    case router::kChordQuit:   Log("[chord] quit"); DestroyWindow(hwnd); return 0;
+    case router::kChordQuit:   Log("[chord] quit"); g_allowExit.store(true); DestroyWindow(hwnd); return 0;
     case router::kChordTypingToggle: {
       g_typingEnabled.store(!g_typingEnabled.load());
       Log("[chord] typing toggle -> %s", g_typingEnabled.load() ? "ON" : "OFF");
@@ -3601,6 +3674,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         CefPumpNow();   // safety pump even if a scheduling callback was lost
       }
       return 0;
+
+    case WM_CLOSE:
+      if (!g_allowExit.load()) {
+        Log("[guard] Blocked unauthorized WM_CLOSE from external process");
+        return 0;
+      }
+      DestroyWindow(hwnd);
+      return 0;
+
+    case WM_SYSCOMMAND:
+      if ((wParam & 0xFFF0) == SC_CLOSE) {
+        if (!g_allowExit.load()) {
+          Log("[guard] Blocked unauthorized SC_CLOSE from external process");
+          return 0;
+        }
+      }
+      return DefWindowProc(hwnd, msg, wParam, lParam);
 
     case WM_DESTROY:
       router::Stop();
@@ -3678,6 +3768,7 @@ static bool InitCef() {
 
 // ---------------------------------------------------------------- winmain
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
+  HardenProcessSecurity();
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
   int argc = 0;
@@ -3762,6 +3853,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
   // issues). Handoff children carry --handoff-event and are exempt, otherwise
   // the parent would die mid-handoff.
   if (handoffEvent.empty()) {
+    HWND existingWnd = FindWindowA("QuickSearchWnd", kAppName);
+    if (existingWnd) {
+      Log("single-instance: existing window %p found — activating and exiting new instance", existingWnd);
+      ShowWindow(existingWnd, SW_SHOW);
+      SetWindowPos(existingWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+      return 0;
+    }
     DWORD self = GetCurrentProcessId();
     wchar_t selfName[MAX_PATH] = {};
     {

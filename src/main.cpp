@@ -31,7 +31,8 @@
 //   - The keyboard hook carries only the global chords; the page gets no
 //     keyboard except Ctrl+V paste (injected into the composer).
 //
-//  Shortcuts: Alt+` hide/show | Ctrl+Alt+S screenshot | Ctrl+Alt+Q quit
+//  Shortcuts: Alt+` hide/show | Alt+S (or Ctrl+Alt+S) screenshot | Alt+Q (or Ctrl+Alt+Q) quit
+//  Window Controls: 'X' button collapses window into a floating, draggable circular widget. Click circle to restore.
 //  Command line: --url <u> --notopmost --x --y --w --h
 //               --hidden --handoff-event <name> --handoff-wait
 // ============================================================================
@@ -50,6 +51,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <algorithm>
 
 #pragma comment(lib, "gdiplus.lib")
 #include <objidl.h>   // IStream/PROPID required by the GDI+ headers
@@ -117,6 +119,7 @@ static bool g_isLoading = false;
 static std::atomic<bool> g_typingEnabled{false};
 static std::atomic<bool> g_shiftToggle{false};
 static std::atomic<bool> g_allowExit{false};
+static std::atomic<bool> g_isMiniCircle{false};
 
 static std::string g_url    = "https://chatgpt.com/";
 static std::string g_dataDir;                  // %LOCALAPPDATA%\QuickSearch
@@ -296,6 +299,10 @@ static void EnsureComposite(int w, int h) {
 static void DrawChrome(HDC hdc, int winW, int winH);
 static void CompositeDragGhost(int winW, int winH);
 static void ComposeAndPresent();
+static void ComposeMiniCircle();
+static void EnterMiniCircle();
+static void RestoreFromMiniCircle();
+static void DrawSidebarShotButton(HDC hdc, int winW, int hdr);
 static void SwitchToSite(int index);
 static HeaderControl HitTestHeader(int wx, int wy, int winW);
 static void InitSiteTabs();
@@ -322,6 +329,10 @@ static void Present() {
 // every CEF OnPaint.
 static void ComposeAndPresent() {
   if (!g_hwnd) return;
+  if (g_isMiniCircle.load()) {
+    ComposeMiniCircle();
+    return;
+  }
   RECT rc;
   GetClientRect(g_hwnd, &rc);
   int winW = rc.right - rc.left, winH = rc.bottom - rc.top;
@@ -352,6 +363,10 @@ static void ComposeAndPresent() {
 static const int kThumbW = 80;
 static const int kThumbPad = 8;
 static const size_t kThumbMax = 40;
+static const int kShotBtnH = 28;
+static const int kShotBtnPad = 6;
+static const int kThumbAreaTopOffset = kShotBtnPad + kShotBtnH + 10;
+static bool g_shotBtnHover = false;
 
 struct Thumb {
   std::vector<BYTE> px;   // premultiplied BGRA, w*h*4
@@ -365,7 +380,7 @@ static int  g_thumbDrag = -1;       // thumbnail index being dragged
 static POINT g_thumbDragPos = {};   // cursor in window px while dragging
 
 static int ThumbY0(int i) {
-  int y = kHeader + kThumbPad;
+  int y = kHeader + kThumbAreaTopOffset;
   for (int j = 0; j < i && j < (int)g_thumbs.size(); ++j)
     y += g_thumbs[j].h + kThumbPad;
   return y;
@@ -376,7 +391,7 @@ static int ThumbListH() {
   return y;
 }
 static void SidebarScrollClamp(int clientH) {
-  int avail = clientH - kHeader - kThumbPad;
+  int avail = clientH - (kHeader + kThumbAreaTopOffset);
   int maxScroll = ThumbListH() - avail;
   if (maxScroll < 0) maxScroll = 0;
   if (g_sidebarScroll < 0) g_sidebarScroll = 0;
@@ -384,6 +399,8 @@ static void SidebarScrollClamp(int clientH) {
 }
 static int ThumbAt(int wx, int wy, int clientW) {
   if (wx < SidebarLeft(clientW)) return -1;
+  int topY = kHeader + kThumbAreaTopOffset;
+  if (wy < topY) return -1;
   for (int i = (int)g_thumbs.size() - 1; i >= 0; --i) {
     int ty = ThumbY0(i) - g_sidebarScroll;
     int tx = SidebarLeft(clientW) + kThumbPad;
@@ -1732,7 +1749,11 @@ static void DoToggle() {
     HWND after = GetParent(g_hwnd) ? HWND_TOP : (g_topmost ? HWND_TOPMOST : HWND_TOP);
     SetWindowPos(g_hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     InvalidateRect(g_hwnd, nullptr, FALSE);
-    ComposeAndPresent();
+    if (g_isMiniCircle.load()) {
+      ComposeMiniCircle();
+    } else {
+      ComposeAndPresent();
+    }
     Log("[toggle] visible (child: %s)", GetParent(g_hwnd) ? "yes" : "no");
   }
 }
@@ -1791,6 +1812,13 @@ static bool Inside(int x, int y) {
   AcquireSRWLockShared(&g_lock);
   rc = g_bounds;
   ReleaseSRWLockShared(&g_lock);
+  if (g_isMiniCircle.load()) {
+    int cx = (rc.left + rc.right) / 2;
+    int cy = (rc.top + rc.bottom) / 2;
+    int r = (rc.right - rc.left) / 2;
+    int dx = x - cx, dy = y - cy;
+    return (dx * dx + dy * dy) <= (r * r);
+  }
   return PtInRect(&rc, { x, y }) == TRUE;
 }
 
@@ -1854,6 +1882,7 @@ static LRESULT CALLBACK MouseProc(int code, WPARAM wParam, LPARAM lParam) {
       if (g_external == 0 && inside) {
         g_owned |= bit;
         Post(msg, x, y, 0, true);      // copy to the page
+        if (g_isMiniCircle.load()) return 1;
       } else {
         g_external |= bit;
       }
@@ -1863,6 +1892,7 @@ static LRESULT CALLBACK MouseProc(int code, WPARAM wParam, LPARAM lParam) {
       Post(msg, x, y, 0, true);        // copy to the page
       g_owned &= ~bit;
       g_external &= ~bit;
+      if (g_isMiniCircle.load()) return 1;
     } else {
       g_external &= ~bit;
     }
@@ -1972,8 +2002,8 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wParam, LPARAM lParam) {
     bool ctrl = IsCtrlDown(), alt = IsAltDown();
     UINT msg = 0;
     if (alt && !ctrl && ks->vkCode == VK_OEM_3) msg = kChordToggle;
-    else if (ctrl && alt && ks->vkCode == 'S') msg = kChordShot;
-    else if (ctrl && alt && ks->vkCode == 'Q') msg = kChordQuit;
+    else if (alt && ks->vkCode == 'S') msg = kChordShot;
+    else if (alt && ks->vkCode == 'Q') msg = kChordQuit;
     else if (ctrl && alt && ks->vkCode == 'T') msg = kChordTypingToggle;
     else if (ctrl && alt && ks->vkCode == 'K') msg = kChordShiftToggle;
     else if (ctrl && !alt && ks->vkCode == 'V' && g_routing && IsVisible()) {
@@ -2966,7 +2996,257 @@ static void DeliverKeyToPage(unsigned msg, DWORD vkCode, DWORD scanCode, DWORD f
   }
 }
 
+// ---------------------------------------------------------------- mini circle
+static const int kMiniSize = 58;
+static RECT g_restoreRect = {};
+static bool g_miniDragging = false;
+static bool g_miniMoved = false;
+static bool g_miniHover = false;
+static POINT g_miniDragStart = {};
+static POINT g_miniWndStart = {};
+
+static void ComposeMiniCircle() {
+  if (!g_hwnd) return;
+  EnsureComposite(kMiniSize, kMiniSize);
+  if (!g_memDC || !g_memBits) return;
+
+  // Fully transparent background outside the circle
+  memset(g_memBits, 0, (size_t)kMiniSize * kMiniSize * 4);
+
+  EnsureGdiPlus();
+  {
+    Gdiplus::Bitmap bmp(kMiniSize, kMiniSize, kMiniSize * 4,
+                        PixelFormat32bppPARGB, (BYTE*)g_memBits);
+    Gdiplus::Graphics g(&bmp);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+
+    float size = (float)kMiniSize;
+    float pad = 3.0f;
+    float diam = size - pad * 2.0f;
+    Gdiplus::RectF circleRc(pad, pad, diam, diam);
+
+    // 1. Soft outer drop shadow / glow
+    Gdiplus::Color shadowColor(70, 0, 0, 0);
+    Gdiplus::SolidBrush shadowBrush(shadowColor);
+    g.FillEllipse(&shadowBrush, 1.5f, 1.5f, size - 3.0f, size - 3.0f);
+
+    // 2. Pure black circle fill
+    Gdiplus::Color blackTop(255, 0x1A, 0x1A, 0x1C);
+    Gdiplus::Color blackBot(255, 0x08, 0x08, 0x0A);
+    Gdiplus::LinearGradientBrush bgBrush(circleRc, blackTop, blackBot, Gdiplus::LinearGradientModeVertical);
+    g.FillEllipse(&bgBrush, circleRc);
+
+    // 3. Subtle dark border ring (highlights softly on hover)
+    Gdiplus::Color ringColor = g_miniHover 
+        ? Gdiplus::Color(255, 0xA0, 0xA0, 0xAC)
+        : Gdiplus::Color(200, 0x44, 0x42, 0x4C);
+    Gdiplus::Pen ringPen(ringColor, g_miniHover ? 2.0f : 1.5f);
+    g.DrawEllipse(&ringPen, circleRc);
+
+    // 4. Inner concentric black circle
+    float innerPad = 10.0f;
+    Gdiplus::RectF innerRc(innerPad, innerPad, size - innerPad * 2.0f, size - innerPad * 2.0f);
+    Gdiplus::Color innerColor = g_miniHover 
+        ? Gdiplus::Color(255, 0x22, 0x22, 0x26) 
+        : Gdiplus::Color(255, 0x00, 0x00, 0x00);
+    Gdiplus::SolidBrush innerBrush(innerColor);
+    g.FillEllipse(&innerBrush, innerRc);
+
+    Gdiplus::Color innerRingCol = g_miniHover 
+        ? Gdiplus::Color(180, 0x6E, 0x6C, 0x78) 
+        : Gdiplus::Color(100, 0x30, 0x2E, 0x36);
+    Gdiplus::Pen innerPen(innerRingCol, 1.0f);
+    g.DrawEllipse(&innerPen, innerRc);
+  }
+
+  Present();
+}
+
+static void EnterMiniCircle() {
+  if (g_isMiniCircle.load() || !g_hwnd) return;
+
+  // 1. Save current window bounds to restore later
+  GetWindowRect(g_hwnd, &g_restoreRect);
+
+  int winW = g_restoreRect.right - g_restoreRect.left;
+  // Center mini circle at the location of the clicked 'X' button
+  int closeCenterX = g_restoreRect.left + (winW - 16);
+  int closeCenterY = g_restoreRect.top + 15;
+  int miniX = closeCenterX - kMiniSize / 2;
+  int miniY = closeCenterY - kMiniSize / 2;
+
+  // Clamp to virtual screen
+  int screenW = GetSystemMetrics(SM_CXSCREEN);
+  int screenH = GetSystemMetrics(SM_CYSCREEN);
+  if (miniX + kMiniSize > screenW) miniX = screenW - kMiniSize - 8;
+  if (miniY + kMiniSize > screenH) miniY = screenH - kMiniSize - 8;
+  if (miniX < 0) miniX = 8;
+  if (miniY < 0) miniY = 8;
+
+  g_isMiniCircle.store(true);
+  g_miniDragging = false;
+  g_miniMoved = false;
+  g_miniHover = false;
+
+  // Set window region to elliptic/circle
+  HRGN hrgn = CreateEllipticRgn(0, 0, kMiniSize, kMiniSize);
+  SetWindowRgn(g_hwnd, hrgn, TRUE);
+
+  if (GetParent(g_hwnd)) {
+    POINT p = { miniX, miniY };
+    ScreenToClient(GetParent(g_hwnd), &p);
+    SetWindowPos(g_hwnd, HWND_TOP, p.x, p.y, kMiniSize, kMiniSize,
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
+  } else {
+    HWND after = g_topmost ? HWND_TOPMOST : HWND_TOP;
+    SetWindowPos(g_hwnd, after, miniX, miniY, kMiniSize, kMiniSize,
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
+  }
+
+  router::UpdateBounds();
+  ComposeMiniCircle();
+  Log("[ui] Entered mini circle mode at %d,%d", miniX, miniY);
+}
+
+static void RestoreFromMiniCircle() {
+  if (!g_isMiniCircle.load() || !g_hwnd) return;
+
+  RECT curMiniRc;
+  GetWindowRect(g_hwnd, &curMiniRc);
+
+  int winW_orig = g_restoreRect.right - g_restoreRect.left;
+  int initMiniX = (g_restoreRect.left + (winW_orig - 16)) - kMiniSize / 2;
+  int initMiniY = (g_restoreRect.top + 15) - kMiniSize / 2;
+  int deltaX = curMiniRc.left - initMiniX;
+  int deltaY = curMiniRc.top - initMiniY;
+
+  int w = g_restoreRect.right - g_restoreRect.left;
+  int h = g_restoreRect.bottom - g_restoreRect.top;
+  if (w < 400) w = 1280;
+  if (h < 300) h = 900;
+  int nx = g_restoreRect.left + deltaX;
+  int ny = g_restoreRect.top + deltaY;
+
+  int screenW = GetSystemMetrics(SM_CXSCREEN);
+  int screenH = GetSystemMetrics(SM_CYSCREEN);
+  if (nx + w > screenW) nx = screenW - w;
+  if (ny + h > screenH) ny = screenH - h;
+  if (nx < 0) nx = 0;
+  if (ny < 0) ny = 0;
+
+  g_isMiniCircle.store(false);
+  g_miniDragging = false;
+  g_miniMoved = false;
+  g_miniHover = false;
+
+  // Restore rectangular window region
+  SetWindowRgn(g_hwnd, nullptr, TRUE);
+
+  if (GetParent(g_hwnd)) {
+    POINT p = { nx, ny };
+    ScreenToClient(GetParent(g_hwnd), &p);
+    SetWindowPos(g_hwnd, HWND_TOP, p.x, p.y, w, h,
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
+  } else {
+    HWND after = g_topmost ? HWND_TOPMOST : HWND_TOP;
+    SetWindowPos(g_hwnd, after, nx, ny, w, h,
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
+  }
+
+  if (g_browser && g_browser->GetHost()) {
+    AllocPage(SidebarLeft(w), h - kHeader);
+    g_browser->GetHost()->WasResized();
+  }
+
+  router::UpdateBounds();
+  InvalidateRect(g_hwnd, nullptr, FALSE);
+  ComposeAndPresent();
+  Log("[ui] Restored from mini circle to %d,%d (%dx%d)", nx, ny, w, h);
+}
+
+static void HandleMiniCircleMouse(unsigned msg, int sx, int sy) {
+  if (!g_hwnd || !g_isMiniCircle.load()) return;
+  RECT rc;
+  GetWindowRect(g_hwnd, &rc);
+  int wx = sx - rc.left;
+  int wy = sy - rc.top;
+  int cx = kMiniSize / 2;
+  int cy = kMiniSize / 2;
+  int dx = wx - cx;
+  int dy = wy - cy;
+  int r = kMiniSize / 2;
+  bool inCircle = (dx * dx + dy * dy <= r * r);
+
+  if (msg == WM_MOUSEMOVE) {
+    if (g_miniDragging) {
+      int moveDx = sx - g_miniDragStart.x;
+      int moveDy = sy - g_miniDragStart.y;
+      if (abs(moveDx) > 3 || abs(moveDy) > 3) {
+        g_miniMoved = true;
+      }
+      if (g_miniMoved) {
+        int nx = g_miniWndStart.x + moveDx;
+        int ny = g_miniWndStart.y + moveDy;
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        if (nx < 0) nx = 0;
+        if (ny < 0) ny = 0;
+        if (nx + kMiniSize > screenW) nx = screenW - kMiniSize;
+        if (ny + kMiniSize > screenH) ny = screenH - kMiniSize;
+        SetWindowPos(g_hwnd, nullptr, nx, ny, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+        router::UpdateBounds();
+      }
+      SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+      return;
+    }
+    if (inCircle != g_miniHover) {
+      g_miniHover = inCircle;
+      ComposeMiniCircle();
+    }
+    if (inCircle) {
+      SetCursor(LoadCursor(nullptr, IDC_HAND));
+    }
+    return;
+  }
+
+  if (msg == WM_LBUTTONDOWN) {
+    if (inCircle) {
+      g_miniDragging = true;
+      g_miniMoved = false;
+      g_miniDragStart = { sx, sy };
+      g_miniWndStart = { rc.left, rc.top };
+    }
+    return;
+  }
+
+  if (msg == WM_LBUTTONUP) {
+    if (g_miniDragging) {
+      g_miniDragging = false;
+      if (!g_miniMoved) {
+        Log("[ui] Mini circle clicked -> restoring to normal");
+        RestoreFromMiniCircle();
+      } else {
+        router::UpdateBounds();
+      }
+    }
+    return;
+  }
+
+  if (msg == WM_RBUTTONUP && inCircle) {
+    Log("[ui] Mini circle right-clicked -> restoring to normal");
+    RestoreFromMiniCircle();
+    return;
+  }
+}
+
 static void DeliverToPage(unsigned msg, int sx, int sy, int data) {
+  if (g_isMiniCircle.load()) {
+    HandleMiniCircleMouse(msg, sx, sy);
+    return;
+  }
   if (!g_browser || !g_browser->GetHost()) return;
   CefRefPtr<CefBrowserHost> bhost = g_browser->GetHost();
 
@@ -3026,9 +3306,8 @@ static void DeliverToPage(unsigned msg, int sx, int sy, int data) {
     if (msg == WM_LBUTTONDOWN) {
       HeaderControl hit = HitTestHeader(wx, wy, clientW);
       if (hit == CTRL_CLOSE) {
-        Log("[ui] Close 'X' button clicked by user — closing app");
-        g_allowExit.store(true);
-        DestroyWindow(g_hwnd);
+        Log("[ui] Close 'X' button clicked by user — minimizing to circle");
+        EnterMiniCircle();
         return;
       }
       if (hit == CTRL_CLEAR) {
@@ -3140,6 +3419,24 @@ static void DeliverToPage(unsigned msg, int sx, int sy, int data) {
     if (msg == WM_LBUTTONUP) { ThumbDropOrCancel(wx, wy, clientW); return; }
   }
   if (wx >= SidebarLeft(clientW) && wy >= hdr) {
+    int btnX0 = SidebarLeft(clientW) + kThumbPad;
+    int btnX1 = btnX0 + kThumbW;
+    int btnY0 = hdr + kShotBtnPad;
+    int btnY1 = btnY0 + kShotBtnH;
+    bool inBtn = (wx >= btnX0 && wx <= btnX1 && wy >= btnY0 && wy <= btnY1);
+
+    if (msg == WM_MOUSEMOVE && g_thumbDrag < 0) {
+      if (inBtn != g_shotBtnHover) {
+        g_shotBtnHover = inBtn;
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        ComposeAndPresent();
+      }
+      if (inBtn) {
+        SetCursor(LoadCursor(nullptr, IDC_HAND));
+        return;
+      }
+    }
+
     if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL) {
       g_sidebarScroll -= (data > 0 ? 90 : -90);
       SidebarScrollClamp(clientH);
@@ -3148,6 +3445,11 @@ static void DeliverToPage(unsigned msg, int sx, int sy, int data) {
       return;
     }
     if (msg == WM_LBUTTONDOWN) {
+      if (inBtn) {
+        Log("[ui] Sidebar SHOT button clicked -> taking screenshot");
+        ScreenshotNow();
+        return;
+      }
       int idx = ThumbAt(wx, wy, clientW);
       if (idx >= 0) {
         g_thumbDrag = idx;
@@ -3163,6 +3465,12 @@ static void DeliverToPage(unsigned msg, int sx, int sy, int data) {
       return;   // sidebar clicks never reach the page
     }
     return;
+  } else {
+    if (g_shotBtnHover) {
+      g_shotBtnHover = false;
+      InvalidateRect(g_hwnd, nullptr, FALSE);
+      ComposeAndPresent();
+    }
   }
 
   // Page area: forward to CEF as OSR events in view (page) coordinates.
@@ -3548,6 +3856,68 @@ static void DrawTopBar(HDC hdc, int winW, int hdr) {
   if (fontSym)  DeleteObject(fontSym);
 }
 
+static void DrawSidebarShotButton(HDC hdc, int winW, int hdr) {
+  int btnX0 = SidebarLeft(winW) + kThumbPad;
+  int btnW = kThumbW;
+  int btnX1 = btnX0 + btnW;
+  int btnY0 = hdr + kShotBtnPad;
+  int btnY1 = btnY0 + kShotBtnH;
+  RECT btnRc = { btnX0, btnY0, btnX1, btnY1 };
+
+  // Draw modern pill button
+  HBRUSH br = CreateSolidBrush(g_shotBtnHover ? RGB(0x2E, 0x4B, 0x75) : RGB(0x23, 0x36, 0x4E));
+  HPEN pn = CreatePen(PS_SOLID, 1, g_shotBtnHover ? RGB(0x60, 0xA5, 0xFA) : RGB(0x3B, 0x61, 0x8F));
+  HGDIOBJ ob = SelectObject(hdc, br);
+  HGDIOBJ op = SelectObject(hdc, pn);
+  RoundRect(hdc, btnRc.left, btnRc.top, btnRc.right, btnRc.bottom, 8, 8);
+  SelectObject(hdc, op);
+  SelectObject(hdc, ob);
+  DeleteObject(pn);
+  DeleteObject(br);
+
+  // Draw camera icon
+  int camX = btnX0 + 8;
+  int camY = btnY0 + 8;
+  int camW = 14;
+  int camH = 11;
+  COLORREF iconCol = g_shotBtnHover ? RGB(0xFF, 0xFF, 0xFF) : RGB(0x93, 0xC5, 0xFD);
+  HPEN camPen = CreatePen(PS_SOLID, 1, iconCol);
+  HGDIOBJ prevPen = SelectObject(hdc, camPen);
+  HGDIOBJ prevBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+
+  // Camera top bump
+  Rectangle(hdc, camX + 4, camY - 2, camX + 9, camY + 1);
+  // Camera body
+  RoundRect(hdc, camX, camY, camX + camW, camY + camH, 3, 3);
+  // Camera lens
+  Ellipse(hdc, camX + 4, camY + 2, camX + 10, camY + 8);
+
+  SelectObject(hdc, prevBrush);
+  SelectObject(hdc, prevPen);
+  DeleteObject(camPen);
+
+  // Draw button label "SHOT"
+  HFONT fontBold = CreateFontW(-11, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+  HGDIOBJ oldF = SelectObject(hdc, fontBold);
+  SetBkMode(hdc, TRANSPARENT);
+  SetTextColor(hdc, g_shotBtnHover ? RGB(0xFF, 0xFF, 0xFF) : RGB(0xE0, 0xF2, 0xFE));
+  RECT textRc = { camX + camW + 5, btnY0, btnX1 - 4, btnY1 };
+  DrawTextW(hdc, L"SHOT", -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+  SelectObject(hdc, oldF);
+  DeleteObject(fontBold);
+
+  // Subtle separator line below button
+  int sepY = btnY1 + 5;
+  HPEN sepPen = CreatePen(PS_SOLID, 1, RGB(0x36, 0x34, 0x3D));
+  HGDIOBJ prevSep = SelectObject(hdc, sepPen);
+  MoveToEx(hdc, SidebarLeft(winW) + 6, sepY, nullptr);
+  LineTo(hdc, winW - 6, sepY);
+  SelectObject(hdc, prevSep);
+  DeleteObject(sepPen);
+}
+
 static void DrawChrome(HDC hdc, int winW, int winH) {
   int hdr = kHeader;
 
@@ -3558,6 +3928,10 @@ static void DrawChrome(HDC hdc, int winW, int winH) {
   HBRUSH sideBg = CreateSolidBrush(RGB(0x23, 0x22, 0x27));
   FillRect(hdc, &sideRc, sideBg);
   DeleteObject(sideBg);
+
+  int topY = hdr + kThumbAreaTopOffset;
+  HRGN clipRgn = CreateRectRgn(SidebarLeft(winW), topY, winW, winH);
+  SelectClipRgn(hdc, clipRgn);
 
   BITMAPINFO bmi = {};
   bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -3572,7 +3946,7 @@ static void DrawChrome(HDC hdc, int winW, int winH) {
     Thumb& t = g_thumbs[i];
     int tx = SidebarLeft(winW) + kThumbPad;
     int ty = ThumbY0(i) - g_sidebarScroll;
-    if (ty + t.h < hdr || ty > winH) continue;
+    if (ty + t.h < topY || ty > winH) continue;
     bmi.bmiHeader.biWidth = t.w;
     bmi.bmiHeader.biHeight = -t.h;
     SetDIBitsToDevice(hdc, tx, ty, t.w, t.h, 0, 0, 0, t.h,
@@ -3582,6 +3956,25 @@ static void DrawChrome(HDC hdc, int winW, int winH) {
   SelectObject(hdc, oldBrush);
   SelectObject(hdc, oldPen);
   DeleteObject(border);
+
+  SelectClipRgn(hdc, nullptr);
+  DeleteObject(clipRgn);
+
+  // If no thumbnails, render subtle guidance hint
+  if (g_thumbs.empty()) {
+    RECT hintRc = { SidebarLeft(winW) + 6, topY + 12, winW - 6, winH - 24 };
+    HFONT fontMuted = CreateFontW(-11, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                  CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HGDIOBJ oldF = SelectObject(hdc, fontMuted);
+    SetTextColor(hdc, RGB(0x6A, 0x68, 0x75));
+    DrawTextW(hdc, L"Click SHOT\nor Alt+S to\ncapture", -1, &hintRc, DT_CENTER | DT_WORDBREAK);
+    SelectObject(hdc, oldF);
+    DeleteObject(fontMuted);
+  }
+
+  // Draw pinned SHOT button at the top of the screenshot section
+  DrawSidebarShotButton(hdc, winW, hdr);
 
   // Bottom-right corner resize grip indicator
   COLORREF gripCol = (g_resizing && g_resizeEdge == RESIZE_BOTTOMRIGHT)
@@ -3625,14 +4018,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_SIZE:
-      if (g_browser && g_browser->GetHost()) {
+      if (!g_isMiniCircle.load() && g_browser && g_browser->GetHost()) {
         RECT rc;
         GetClientRect(hwnd, &rc);
         AllocPage(SidebarLeft(rc.right - rc.left), rc.bottom - rc.top - kHeader);
         g_browser->GetHost()->WasResized();
       }
       InvalidateRect(hwnd, nullptr, FALSE);
-      ComposeAndPresent();
+      if (g_isMiniCircle.load()) {
+        ComposeMiniCircle();
+      } else {
+        ComposeAndPresent();
+      }
       break;
 
     case WM_DPICHANGED: {
@@ -4029,6 +4426,22 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
       host::ConsumeZDirty();   // + instantly when SEB reorders itself
     }
     if (now - lastWatch >= 50)  { lastWatch = now; handoff::Watch(); }
+    if (g_isMiniCircle.load() && g_miniHover && !g_miniDragging) {
+      POINT pt;
+      if (GetCursorPos(&pt)) {
+        RECT rc;
+        GetWindowRect(g_hwnd, &rc);
+        int cx = (rc.left + rc.right) / 2;
+        int cy = (rc.top + rc.bottom) / 2;
+        int r = kMiniSize / 2;
+        int dx = pt.x - cx, dy = pt.y - cy;
+        if (dx * dx + dy * dy > r * r) {
+          g_miniHover = false;
+          ComposeMiniCircle();
+          SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        }
+      }
+    }
     if (g_hooksUp && g_routing) router::UpdateBounds();
   }
 

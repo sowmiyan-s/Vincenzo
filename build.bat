@@ -41,15 +41,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM AffHook.dll — native loader (APC entry + native in-target sweep).
-REM Plain kernel32/user32/ole32 links only — no .NET SDK headers required.
+REM AffHook.dll ? native loader (APC entry + native in-target sweep).
+REM Plain kernel32/user32/ole32 links only ? no .NET SDK headers required.
 cl /nologo /O2 /MT /DNDEBUG /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /EHsc /LD src\affhook.cpp /Fe:portable\AffHook.dll /Fo:portable\obj\affhook.obj /link user32.lib kernel32.lib ole32.lib /PDBALTPATH:quicksearch.pdb
 if errorlevel 1 (
     echo [ERROR] affhook build failed
     exit /b 1
 )
 
-REM AffManaged.dll — managed WDA_NONE sweeper run inside the target's CLR.
+REM AffManaged.dll ? managed WDA_NONE sweeper run inside the target's CLR.
 where csc >nul 2>nul
 if not errorlevel 1 (
     csc /nologo /target:library /optimize /out:portable\AffManaged.dll src\affmanaged.cs
